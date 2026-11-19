@@ -49,7 +49,7 @@
       position: absolute;
       left: 50%;
       bottom: var(--youdub-bottom, ${DEFAULT_BOTTOM}%);
-      z-index: 40;
+      z-index: 60; /* over the hidden controls (59), so a grab never lands on the progress bar */
       max-width: min(90%, 44em); /* wide lines: one or two, not a narrow column */
       text-align: center;
       text-wrap: balance;
@@ -69,6 +69,9 @@
       cursor: grab;
     }
     #${CAPTION_ID}.dragging {
+      opacity: 1; /* a caption change mid-drag must not drop the pointer */
+      transform: translate(-50%, 0);
+      pointer-events: auto;
       cursor: grabbing;
       transition: opacity 160ms ease-out, transform 160ms ease-out; /* follow the pointer, no easing */
     }
@@ -248,7 +251,7 @@
     // A click on the caption must not reach the player, which would pause the video.
     for (const type of ["click", "mousedown", "mouseup", "dblclick"]) box.addEventListener(type, (e) => e.stopPropagation());
     box.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 || box.classList.contains("dragging")) return;
       event.preventDefault();
       event.stopPropagation();
       const area = player.getBoundingClientRect();
@@ -260,6 +263,8 @@
       const move = (e) => {
         bottom = placeBox(box, player, ((from + startY - e.clientY) / area.height) * 100);
       };
+      // lostpointercapture follows pointerup and pointercancel, and also comes when the
+      // capture is lost some other way: the drag always ends.
       const end = () => {
         box.removeEventListener("pointermove", move);
         box.classList.remove("dragging");
@@ -268,8 +273,7 @@
         } catch {}
       };
       box.addEventListener("pointermove", move);
-      box.addEventListener("pointerup", end, { once: true });
-      box.addEventListener("pointercancel", end, { once: true });
+      box.addEventListener("lostpointercapture", end, { once: true });
     });
     box.addEventListener("dblclick", () => {
       placeBox(box, player, DEFAULT_BOTTOM);
