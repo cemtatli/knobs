@@ -1,11 +1,12 @@
-"""Translation and punctuation in a child process that exits when idle.
+"""Translation and punctuation in short-lived child processes.
 
 The translator holds ~380 MB once used, and freeing its model inside the server gave
 nothing back: the allocator keeps the pages (measured: 643 MB before and after unloading).
 A process that exits does give them back. The page translates a video's sentences ahead
 in batches, so the child is busy for the first seconds of a video and then goes away; the
-server itself stays at the voice's ~290 MB. It runs at low priority, so the video and the
-voice come first.
+server itself stays at the voice's baseline. Punctuation exits after each request so
+its ONNX and PyTorch allocations are gone before the translator loads. Only one child
+runs at a time, including when several tabs are dubbing.
 
   parent: Worker().call("translate", items=[[text, chars], ...])  ->  ["...", ...]
           Worker().call("punctuate", text="...")                   ->  ["...", ...]
@@ -28,38 +29,63 @@ log = logging.getLogger("youdub")
 class Worker:
     def __init__(self):
         self.process = None
+        self.operation = None
         self.lock = threading.Lock()  # one request at a time; the child is single-threaded
         self.last_used = 0.0
         threading.Thread(target=self._stop_when_idle, daemon=True).start()
 
     def call(self, op, **args):
         with self.lock:
-            if self.process is None or self.process.poll() is not None:
-                self.process = subprocess.Popen(
-                    [sys.executable, __file__], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
-                )
-                log.info("worker started (pid %d)", self.process.pid)
-            self.process.stdin.write(json.dumps({"op": op, **args}) + "\n")
-            self.process.stdin.flush()
-            line = self.process.stdout.readline()
-            self.last_used = time.monotonic()
-        if not line:
-            raise RuntimeError("worker exited")
-        reply = json.loads(line)
+            try:
+                if self.process is None or self.operation != op or self.process.poll() is not None:
+                    self._stop()
+                    self.process = subprocess.Popen(
+                        [sys.executable, __file__], stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding="utf-8"
+                    )
+                    self.operation = op
+                    log.info("%s worker started (pid %d)", op, self.process.pid)
+                self.process.stdin.write(json.dumps({"op": op, **args}) + "\n")
+                self.process.stdin.flush()
+                line = self.process.stdout.readline()
+                if not line:
+                    raise OSError(f"{op} worker exited")
+                reply = json.loads(line)
+            except (OSError, ValueError) as error:
+                self._stop()
+                raise RuntimeError(str(error)) from error
+            finally:
+                self.last_used = time.monotonic()
+                if op == "punctuate":
+                    self._stop()
         if "error" in reply:
             raise RuntimeError(reply["error"])
         return reply["result"]
+
+    def _stop(self):
+        if self.process is None:
+            return
+        process, operation = self.process, self.operation
+        self.process = self.operation = None
+        try:
+            process.stdin.close()  # the child exits at end of input
+        except BrokenPipeError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        finally:
+            process.stdout.close()
+        log.info("%s worker stopped", operation)
 
     def _stop_when_idle(self):
         while True:
             time.sleep(5)
             with self.lock:
                 idle = time.monotonic() - self.last_used > IDLE_SECONDS
-                if self.process and self.process.poll() is None and idle:
-                    self.process.stdin.close()  # the child exits at end of input
-                    self.process.wait(timeout=10)
-                    log.info("worker stopped (idle)")
-                    self.process = None
+                if self.process and idle:
+                    self._stop()
 
 
 def main():
