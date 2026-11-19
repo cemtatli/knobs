@@ -47,7 +47,7 @@ All run on your CPU. Nothing leaves your machine.
 | Translation (EN → TR) | [OPUS-MT tc-big en-tr](https://huggingface.co/Helsinki-NLP/opus-mt-tc-big-en-tr), int8 | ~230 MB | CC-BY-4.0 |
 | Punctuation (EN auto captions) | [punct_cap_seg_en](https://huggingface.co/1-800-BAD-CODE/punct_cap_seg_en), int8 | ~53 MB | Apache 2.0 |
 
-About 730 MB of RAM while **TR** is on. Translation runs in a separate low-priority process that exits 20 s after its last request.
+Knobs keeps a short window of synthesized audio around the current playback position. The punctuation process exits after each request, and the translation process exits after about 20 seconds of inactivity. Peak memory depends on the platform and caption length.
 
 ## Debugging
 

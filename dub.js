@@ -35,6 +35,7 @@
   const MERGE_GAP = 0.5; // join neighbouring sentences closer than this for natural flow
   const MERGE_MAX_SECONDS = 10;
   const MERGE_MAX_CHARS = 220;
+  const MERGE_MAX_SOURCE_SENTENCES = 3;
   const log = (...args) => console.debug("[youdub]", ...args);
 
   const state = {
@@ -58,61 +59,7 @@
 
   // --- captions -------------------------------------------------------------
 
-  // The player sends caption requests with the right token itself. We keep a copy of
-  // every caption response it receives, keyed by video, source language and target, and
-  // the last request URL per video and language: with its token we can ask for the same
-  // track with another target ourselves.
-  const captured = new Map();
-  const capturedUrls = new Map(); // "videoId|lang" -> URL
-  const captionKey = (videoId, lang, tlang) => `${videoId}|${lang}|${tlang ?? ""}`;
-  // YouTube answers a refused request (too many requests) with an HTML "Sorry..." page.
-  const isCaptionJson = (body) => body?.trim().startsWith("{");
-  let refused = false;
-
-  function remember(url, body) {
-    if (!isCaptionJson(body)) {
-      if (body?.includes("<html")) refused = true;
-      return;
-    }
-    try {
-      const parsed = new URL(url, location.origin);
-      const params = parsed.searchParams;
-      if (params.get("fmt") !== "json3") return;
-      captured.set(captionKey(params.get("v"), params.get("lang"), params.get("tlang")), body);
-      capturedUrls.set(`${params.get("v")}|${params.get("lang")}`, parsed);
-    } catch {}
-  }
-
-  // The player keeps the track it shows: asked for plain English while it shows English →
-  // Turkish, it sends nothing. Reuse its last URL (and token) with our target instead.
-  function siblingUrl(videoId, lang, tlang) {
-    const known = capturedUrls.get(`${videoId}|${lang}`);
-    if (!known) return null;
-    const url = new URL(known);
-    if (tlang) url.searchParams.set("tlang", tlang);
-    else url.searchParams.delete("tlang");
-    return url.toString();
-  }
-  const xhrOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    if (String(url).includes("/api/timedtext")) {
-      this.addEventListener("load", () => remember(String(url), this.responseText));
-    }
-    return xhrOpen.call(this, method, url, ...rest);
-  };
-  const pageFetch = window.fetch;
-  window.fetch = async function (input, init) {
-    const response = await pageFetch.call(this, input, init);
-    const url = typeof input === "string" ? input : input?.url;
-    if (url?.includes("/api/timedtext")) {
-      response
-        .clone()
-        .text()
-        .then((body) => remember(url, body))
-        .catch(() => {});
-    }
-    return response;
-  };
+  const captions = window.__youdubCaptions;
 
   // YouTube rejects caption requests without the PO token the player itself uses.
   function tokenParams() {
@@ -162,6 +109,7 @@
       tracks.find((t) => t.isTranslatable) ??
       null;
     if (!source) return null;
+    if (source.languageCode === TARGET_LANG) return { track: source, translate: false };
     if (localTranslation && source.languageCode.startsWith("en")) return { track: source, translate: false, local: true };
     return { track: source, translate: true };
   }
@@ -188,6 +136,7 @@
   // people do: the voice would read "/" as "eğik çizgi".
   function speakable(text) {
     return withoutTags(text)
+      .normalize("NFC")
       .replace(/(\S\.\p{L}{2,})\/\S*/gu, "$1") // a link: keep the site, drop the path
       .replace(/(?<!\p{L})ve\s*\/\s*veya(?!\p{L})/giu, "veya")
       .replace(/(\p{L})\s*\/\s*(?=\p{L})/gu, "$1 ya da ") // kullanıcı/müşteri
@@ -207,7 +156,7 @@
       .replace(/\s[-–—]+\s/g, ", ") // a dash between words is a pause, not "tire"
       // Anything else that isn't a letter, digit or punctuation would be read out by name
       // ("büyük işareti" for ">"), so it goes.
-      .replace(/[^\p{L}\p{N}\p{M}\s.,!?…:;'’"()\-]/gu, " ")
+      .replace(/[^\p{L}\p{N}\p{M}\s.,!?…:;'’"“”()\-]/gu, " ")
       .replace(/\s+([.,!?…:;])/g, "$1")
       .replace(/\s+/g, " ")
       .trim();
@@ -216,19 +165,24 @@
   // Auto captions have no punctuation, and the voice takes its intonation from it (a "?"
   // ends high, "," and "." pause), so we add it where the speaker paused or a sentence ends.
   const COMMA_GAP = 0.25; // seconds of silence between caption lines that read as a comma
-  const ENDS_PUNCTUATED = /[.,!?…:;]["')\]]?$/;
-  // Turkish asks with the particle mı/mi/mu/mü, often with a person ending: "istiyor musun".
-  const ENDS_QUESTION = /(?<!\p{L})(mı|mi|mu|mü)(yım|yim|yum|yüm|sın|sin|sun|sün|yız|yiz|yuz|yüz|sınız|siniz|sunuz|sünüz|dır|dir|dur|dür|ydı|ydi|ydu|ydü|ymış|ymiş|ymuş|ymüş)?$/iu;
+  const CLOSING_MARKS = /["'”’)\]]+$/u;
+  // Turkish question particles can carry tense and person endings together ("gelmiş miydiniz").
+  const ENDS_QUESTION = /(?<!\p{L})m[ıiuü](?:y[ıiuü][mz]|s[ıiuü]n(?:[ıiuü]z)?|(?:yd[ıiuü]|ym[ıiuü]ş|d[ıiuü]r)(?:[mnk]|n[ıiuü]z|[ıiuü]m|s[ıiuü]n(?:[ıiuü]z)?|[ıiuü]z|l[ae]r)?)?$/u;
 
-  function pause(text) {
-    if (ENDS_PUNCTUATED.test(text)) return text;
-    return text + (ENDS_QUESTION.test(text) ? "?" : ",");
+  function punctuateEnd(text, mark) {
+    if (!text) return "";
+    const closing = text.match(CLOSING_MARKS)?.[0] ?? "";
+    let body = text.slice(0, text.length - closing.length);
+    if (mark === ".") body = body.replace(/,$/, "");
+    if (/[.,!?…:;]$/.test(body)) return body + closing;
+    const question = ENDS_QUESTION.test(body.toLocaleLowerCase("tr"));
+    return body + (question ? "?" : mark) + closing;
   }
 
+  const pause = (text) => punctuateEnd(text, ",");
+
   function closeSentence(text) {
-    text = text.replace(/,$/, "");
-    if (ENDS_PUNCTUATED.test(text)) return text;
-    return text + (ENDS_QUESTION.test(text) ? "?" : ".");
+    return punctuateEnd(text, ".");
   }
 
   // json3 events → lines → speakable cues. A cue ends at sentence punctuation,
@@ -242,13 +196,14 @@
       const text = english ? withoutTags(raw) : speakable(raw);
       if (!text) continue;
       const start = event.tStartMs / 1000;
-      lines.push({ start, end: start + (event.dDurationMs ?? 0) / 1000, text });
+      const newSpeaker = /^\s*(?:>>|&gt;&gt;)/.test(raw);
+      lines.push({ start, end: start + (event.dDurationMs ?? 0) / 1000, text, newSpeaker });
     }
 
     const cues = [];
     let current = null;
     lines.forEach((line, i) => {
-      if (!current) current = { start: line.start, end: line.end, text: line.text };
+      if (!current) current = { ...line };
       else {
         if (line.start - lines[i - 1].end >= COMMA_GAP) current.text = pause(current.text);
         current.text += ` ${line.text}`;
@@ -256,7 +211,7 @@
       }
       const next = lines[i + 1];
       const gap = next ? next.start - line.end : Infinity;
-      const sentenceEnd = /[.!?…]["')\]]?$/.test(current.text) || gap > 1.2;
+      const sentenceEnd = /[.!?…]["'”’)\]]*$/.test(current.text) || next?.newSpeaker || gap > 1.2;
       const done = sentenceEnd || current.end - current.start >= 7;
       if (done) {
         // Cut only for length: likely mid-sentence, so keep the voice up with a comma.
@@ -267,22 +222,35 @@
     });
     if (current) cues.push({ ...current, text: closeSentence(current.text) });
 
-    // Longer utterances keep the voice's intonation flowing instead of resetting per line.
+    if (english) for (const cue of cues) [cue.source, cue.text] = [cue.text, null];
+    return mergeCues(cues, english);
+  }
+
+  // Keep the voice flowing across short gaps. Translate each source sentence separately
+  // because OPUS-MT sometimes drops one when given several as a single input.
+  function mergeCues(cues, english) {
+    const field = english ? "source" : "text";
     const merged = [];
     for (const cue of cues) {
       const last = merged[merged.length - 1];
       if (
         last &&
+        !cue.newSpeaker &&
         cue.start - last.end < MERGE_GAP &&
         cue.end - last.start <= MERGE_MAX_SECONDS &&
-        last.text.length + cue.text.length < MERGE_MAX_CHARS
+        last[field].length + cue[field].length < MERGE_MAX_CHARS &&
+        (!english || last.parts.length < MERGE_MAX_SOURCE_SENTENCES)
       ) {
-        last.text += ` ${cue.text}`;
+        last[field] += ` ${cue[field]}`;
         last.end = Math.max(last.end, cue.end);
-      } else merged.push({ ...cue });
+        if (english) last.parts.push({ source: cue.source, start: cue.start });
+      } else {
+        const { newSpeaker, ...entry } = cue;
+        if (english) entry.parts = [{ source: entry.source, start: entry.start }];
+        merged.push(entry);
+      }
     }
-    for (const cue of merged) cue.text = closeSentence(cue.text);
-    if (english) for (const cue of merged) [cue.source, cue.text] = [cue.text, null];
+    if (!english) for (const cue of merged) cue.text = closeSentence(cue.text);
     return merged;
   }
 
@@ -341,21 +309,7 @@
       first = last + 1;
     }
     if (first < words.length) cues[cues.length - 1].end = words[words.length - 1].start + 0.6;
-    // Short neighbouring sentences go together, as in buildCues, for a natural flow.
-    const merged = [];
-    for (const cue of cues) {
-      const last = merged[merged.length - 1];
-      if (
-        last &&
-        cue.start - last.end < MERGE_GAP &&
-        cue.end - last.start <= MERGE_MAX_SECONDS &&
-        last.source.length + cue.source.length < MERGE_MAX_CHARS
-      ) {
-        last.source += ` ${cue.source}`;
-        last.end = Math.max(last.end, cue.end);
-      } else merged.push(cue);
-    }
-    return merged;
+    return mergeCues(cues, true);
   }
 
   function pauseCues(words) {
@@ -382,7 +336,7 @@
       }
     }
     if (first < words.length) cut(words.length - 1);
-    return cues;
+    return mergeCues(cues, true);
   }
 
   async function buildAsrCues(json) {
@@ -397,46 +351,50 @@
 
   // 1) Ask the player to show the Turkish captions; it fetches them with its own token
   //    and the hook above keeps the response. 2) If nothing arrives, request them directly.
-  async function loadCues(videoId, localTranslation = false) {
+  async function loadCues(videoId, localTranslation = false, isCurrent = () => true) {
     const choice = pickTrack(localTranslation);
     if (!choice) throw new Error("Bu videoda altyazı yok.");
     const lang = choice.track.languageCode;
     const tlang = choice.translate ? TARGET_LANG : undefined;
-    const key = captionKey(videoId, lang, tlang);
-    refused = false;
+    const key = captions.key(videoId, lang, tlang);
+    let body = captions.get(key);
 
-    if (!captured.has(key)) {
+    if (!body) {
       const player = getPlayer();
       player?.loadModule?.("captions");
       player?.setOption?.("captions", "track", {
         languageCode: lang,
         ...(tlang ? { translationLanguage: { languageCode: tlang } } : {}),
       });
-      for (let i = 0; i < 25 && !captured.has(key); i += 1) await wait(200);
+      for (let i = 0; i < 25 && !body && isCurrent(); i += 1) {
+        await wait(200);
+        body = captions.get(key);
+      }
+      if (!isCurrent()) return null;
       window.dispatchEvent(new Event("youdub-captions-changed")); // subtitles.js puts its track back
     }
 
-    let body = captured.get(key);
-    for (const url of body ? [] : [siblingUrl(videoId, lang, tlang), captionUrl(choice)]) {
+    for (const url of body ? [] : [captions.siblingUrl(videoId, lang, tlang), captionUrl(choice)]) {
       if (!url) continue;
-      const response = await pageFetch(url, { credentials: "include" }).catch(() => null);
-      body = response ? await response.text() : "";
-      if (isCaptionJson(body)) break;
-      if (body.includes("<html") || response?.status === 429) refused = true;
-      body = "";
+      const fetched = await captions.fetchText(url).catch(() => null);
+      if (!isCurrent()) return null;
+      if (captions.isJson(fetched)) {
+        body = fetched;
+        break;
+      }
     }
     if (!body) {
       throw new Error(
-        refused
+        captions.refused(key)
           ? "YouTube altyazı isteklerini geçici olarak engelledi (çok fazla istek). Biraz sonra tekrar dene."
           : "Altyazı alınamadı. Altyazıyı (CC) bir kez açıp kapatıp tekrar dene.",
       );
     }
     const json = JSON.parse(body);
     const cues = choice.local && choice.track.kind === "asr" ? await buildAsrCues(json) : buildCues(json, Boolean(choice.local));
-    state.translator = choice.local ? "local" : tlang ? "youtube" : "none";
-    log("cues", cues.length, lang, tlang ? `→ ${tlang}` : "", state.translator);
-    return cues;
+    const translator = choice.local ? "local" : tlang ? "youtube" : "none";
+    log("cues", cues.length, lang, tlang ? `→ ${tlang}` : "", translator);
+    return { cues, translator };
   }
 
   // --- speech ---------------------------------------------------------------
@@ -495,9 +453,11 @@
 
   // Local EMA Lightning voice (server/run.sh). Falls back to the browser's voice.
   const PREFETCH_AHEAD = 20; // seconds of upcoming sentences to synthesize early
-  const audioCache = new Map(); // cue index -> Promise<{ url, duration } | null>
+  const PREFETCH_CLIPS = 8;
+  const REPLAY_CLIPS = 2;
+  const audioCache = new Map(); // cue index -> queued, in-flight, or ready clip
   let current = null; // the <audio> playing now (EMA engine)
-  let busy = false; // a sentence is playing or about to
+  let activeIndex = null; // a sentence is playing or about to
   let generation = 0; // bumps on seek/stop so stale replies are dropped
 
   // Ask the extension (bridge.js → background.js) to start the local voice. It runs only
@@ -566,9 +526,7 @@
   }
 
   // Speak faster only as much as the sentence needs to fit before the next one starts.
-  function plannedSpeed(index) {
-    const cue = state.cues[index];
-    const next = state.cues[index + 1];
+  function plannedSpeed(cue, next) {
     const slot = Math.max(0.8, (next ? next.start : cue.end + 1.5) - cue.start) + DRIFT_ALLOWANCE;
     const needed = cue.text.length / EMA_CHARS_PER_SEC;
     return Math.round(Math.min(MAX_SPEED, Math.max(1, needed / slot)) * 100) / 100;
@@ -578,34 +536,35 @@
   // the prefetch window at once (start, every seek) left the sentence due now at the back
   // of the queue: it came late, then had to rush or was skipped.
   const MAX_IN_FLIGHT = 2;
-  const queued = new Map(); // cue index -> { promise, resolve }, not sent yet
+  const queued = new Set(); // cue indices that haven't been sent yet
   let inFlight = 0;
 
   function synth(index) {
     if (!audioCache.has(index)) {
       let resolve;
       const promise = new Promise((r) => (resolve = r));
-      audioCache.set(index, promise);
-      queued.set(index, { promise, resolve });
+      audioCache.set(index, { promise, resolve, clip: null });
+      queued.add(index);
       pumpSynth();
     }
-    return audioCache.get(index);
+    return audioCache.get(index).promise;
   }
 
   function pumpSynth() {
     while (inFlight < MAX_IN_FLIGHT && queued.size) {
-      const index = Math.min(...queued.keys());
-      const { promise, resolve } = queued.get(index);
+      const index = Math.min(...queued);
+      const entry = audioCache.get(index);
+      const cue = state.cues[index];
+      const next = state.cues[index + 1];
       queued.delete(index);
       inFlight += 1;
-      requestClip(index).then((clip) => {
+      requestClip(index, cue, next, entry).then((clip) => {
         inFlight -= 1;
-        if (audioCache.get(index) !== promise) {
-          if (clip) URL.revokeObjectURL(clip.url); // cache was cleared meanwhile (new video)
-        } else if (!clip) {
-          audioCache.delete(index); // failed: ask again next time instead of staying silent
-        }
-        resolve(clip);
+        if (audioCache.get(index) === entry) {
+          entry.clip = clip;
+          if (!clip && cue.text !== "") audioCache.delete(index); // retry temporary failures
+          entry.resolve(clip);
+        } else if (clip) URL.revokeObjectURL(clip.url);
         pumpSynth();
       });
     }
@@ -613,11 +572,7 @@
 
   // After a seek the queued sentences may be far from where we are now.
   function dropQueued() {
-    for (const [index, { resolve }] of queued) {
-      audioCache.delete(index);
-      resolve(null);
-    }
-    queued.clear();
+    for (const index of queued) evictClip(index);
   }
 
   // English cues are translated ahead, a few sentences per request, from where the video is
@@ -627,74 +582,109 @@
   // normal speed, if it has one.
   const TRANSLATE_BATCH = 8;
 
-  function translateBatch(from) {
-    const cues = state.cues;
+  function translateBatch(cues, from, size = TRANSLATE_BATCH) {
     const batch = [];
-    for (let i = from; i < cues.length && batch.length < TRANSLATE_BATCH; i += 1) {
+    for (let i = from; i < cues.length && i < from + size; i += 1) {
       if (cues[i].text === null && !cues[i].pending) batch.push(i);
     }
-    const items = batch.map((i) => {
-      const next = cues[i + 1];
-      const slot = (next ? next.start : cues[i].end + 1.5) - cues[i].start;
-      return [cues[i].source, Math.round(slot * EMA_CHARS_PER_SEC)];
+    if (!batch.length) return Promise.resolve(true);
+    const items = batch.flatMap((i) => {
+      const cue = cues[i];
+      return cue.parts.map(({ source, start }, j) => {
+        const until = cue.parts[j + 1]?.start ?? cues[i + 1]?.start ?? cue.end + 1.5;
+        return [source, Math.round(Math.max(0.8, until - start) * EMA_CHARS_PER_SEC)];
+      });
     });
     const request = voiceRequest("/translate", { items }).then((data) => {
       const texts = data && parseJson(data)?.texts;
-      batch.forEach((i, k) => {
-        delete cues[i].pending;
-        if (texts) cues[i].text = closeSentence(speakable(texts[k] ?? "")); // "" = nothing to say
-      });
-      return Boolean(texts);
+      const valid = Array.isArray(texts) && texts.length === items.length && texts.every((text) => typeof text === "string");
+      let offset = 0;
+      for (const i of batch) {
+        const cue = cues[i];
+        delete cue.pending;
+        if (!valid) continue;
+        const end = offset + cue.parts.length;
+        cue.text = texts.slice(offset, end).map((text) => closeSentence(speakable(text))).filter(Boolean).join(" ");
+        offset = end;
+      }
+      return valid;
     });
     for (const i of batch) cues[i].pending = request;
     return request;
   }
 
-  async function translateAhead(cues) {
-    while (state.on && state.cues === cues) {
-      const open = (i) => cues[i].text === null && !cues[i].pending;
-      let from = cues.findIndex((_, i) => i >= state.index && open(i));
-      if (from === -1) from = cues.findIndex((_, i) => open(i));
-      if (from === -1) return log("all sentences translated");
-      if (!(await translateBatch(from))) await wait(2000); // the next try, not a busy loop
+  async function translateAhead(cues, isCurrent) {
+    let first = 0;
+    const open = (cue) => cue.text === null && !cue.pending;
+    while (isCurrent()) {
+      while (first < cues.length && cues[first].text !== null) first += 1;
+      let from = Math.max(first, state.index);
+      while (from < cues.length && !open(cues[from])) from += 1;
+      if (from === cues.length) {
+        from = first;
+        while (from < state.index && !open(cues[from])) from += 1;
+        if (from >= state.index) return;
+      }
+      if (!(await translateBatch(cues, from))) await wait(2000); // retry failed inference without a busy loop
     }
   }
 
   function cueText(index) {
-    const cue = state.cues[index];
+    const cues = state.cues;
+    const cue = cues[index];
     if (cue.text !== null) return Promise.resolve(cue.text || null);
-    return (cue.pending ?? translateBatch(index)).then(() => cue.text || null);
+    return (cue.pending ?? translateBatch(cues, index)).then(() => cue.text || null);
   }
 
-  function requestClip(index) {
+  function requestClip(index, cue, next, entry) {
     return cueText(index)
-      .then((text) => text && voiceRequest("/speak", { text, speed: plannedSpeed(index) }))
-      .then((data) => data && new Blob([data], { type: "audio/wav" }))
-      .then(
-        (blob) =>
-          blob &&
-          new Promise((resolve) => {
-            const url = URL.createObjectURL(blob);
-            const probe = new Audio(url);
-            probe.addEventListener(
-              "loadedmetadata",
-              () => resolve({ url, duration: probe.duration, speed: plannedSpeed(index) }),
-              { once: true },
-            );
-            probe.addEventListener("error", () => resolve(null), { once: true });
-          }),
-      )
+      .then(async (text) => {
+        if (!text || audioCache.get(index) !== entry) return null;
+        const speed = plannedSpeed(cue, next);
+        const data = await voiceRequest("/speak", { text, speed });
+        if (!data || audioCache.get(index) !== entry) return null;
+        const duration = wavDuration(data);
+        if (!duration) return null;
+        const url = URL.createObjectURL(new Blob([data], { type: "audio/wav" }));
+        return { url, duration, speed };
+      })
       .catch(() => null);
   }
 
+  // server.py writes a 44-byte PCM WAV header using Python's wave module.
+  function wavDuration(data) {
+    if (data.byteLength < 44) return 0;
+    const wav = new DataView(data);
+    if (wav.getUint32(0) !== 0x52494646 || wav.getUint32(8) !== 0x57415645 || wav.getUint32(36) !== 0x64617461) return 0;
+    const bytesPerSecond = wav.getUint32(28, true);
+    const length = wav.getUint32(40, true);
+    return bytesPerSecond && length <= data.byteLength - 44 ? length / bytesPerSecond : 0;
+  }
+
+  function evictClip(index) {
+    const entry = audioCache.get(index);
+    queued.delete(index);
+    audioCache.delete(index);
+    entry.resolve(null);
+    if (entry.clip) URL.revokeObjectURL(entry.clip.url);
+  }
+
+  function pruneAudioCache(time) {
+    for (const index of audioCache.keys()) {
+      if (index === activeIndex) continue;
+      if (index < state.index - REPLAY_CLIPS || index >= state.index + PREFETCH_CLIPS ||
+          state.cues[index].start >= time + PREFETCH_AHEAD) evictClip(index);
+    }
+  }
+
   function prefetch(time) {
-    for (let i = state.index; i < state.cues.length && state.cues[i].start < time + PREFETCH_AHEAD; i += 1) synth(i);
+    pruneAudioCache(time);
+    const end = Math.min(state.index + PREFETCH_CLIPS, state.cues.length);
+    for (let i = state.index; i < end && state.cues[i].start < time + PREFETCH_AHEAD; i += 1) synth(i);
   }
 
   function clearAudioCache() {
-    dropQueued();
-    for (const request of audioCache.values()) request.then((clip) => clip && URL.revokeObjectURL(clip.url));
-    audioCache.clear();
+    for (const index of audioCache.keys()) evictClip(index);
   }
 
   // How long this sentence may take before the next one should start.
@@ -717,9 +707,18 @@
     setVideoRate(video, baseRate);
   }
 
-  function finish(video) {
-    busy = false;
+  function releaseAudio() {
+    if (!current) return;
+    const audio = current;
     current = null;
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+  }
+
+  function finish(video) {
+    activeIndex = null;
+    releaseAudio();
     restoreRate(video); // the original audio comes back in tick() if no sentence follows soon
   }
 
@@ -727,7 +726,7 @@
     const cue = state.cues[index];
     const next = state.cues[index + 1];
     const ticket = generation;
-    busy = true;
+    activeIndex = index;
     synth(index).then((clip) => {
       if (ticket !== generation) return;
       if (!clip || video.currentTime - cue.start > EMA_LATE_SKIP) return finish(video);
@@ -743,12 +742,13 @@
         slowed = true;
         setVideoRate(video, baseRate * slow);
       }
-      audio.addEventListener("ended", () => finish(video), { once: true });
-      audio.addEventListener("error", () => finish(video), { once: true });
+      const done = () => { if (current === audio) finish(video); };
+      audio.addEventListener("ended", done, { once: true });
+      audio.addEventListener("error", done, { once: true });
       current = audio;
       duck(video);
       if (video.paused) return; // play resumes it
-      audio.play().catch(() => finish(video));
+      audio.play().catch(done);
     });
   }
 
@@ -765,18 +765,22 @@
     speechSynthesis.speak(utterance);
   }
 
-  const speaking = () => (state.engine === "ema" ? busy : speechSynthesis.speaking);
+  const speaking = () => (state.engine === "ema" ? activeIndex !== null : speechSynthesis.speaking);
 
   // Landing inside a sentence: start with it only if it has just begun. Joining it seconds
   // late meant rushing to catch up; the next sentence comes soon anyway.
   function resetIndex(time) {
-    const i = state.cues.findIndex((cue) => cue.start >= time - SEEK_JOIN);
-    state.index = i === -1 ? state.cues.length : i;
+    state.index = indexAt(state.cues, time);
+  }
+
+  function indexAt(cues, time) {
+    const index = cues.findIndex((cue) => cue.start >= time - SEEK_JOIN);
+    return index === -1 ? cues.length : index;
   }
 
   function tick() {
     const video = getVideo();
-    if (!video || !state.cues.length || video.paused) return;
+    if (!video || !state.cues.length || video.paused || video.seeking) return;
     // During an ad the same <video> plays the ad, so its time means nothing to our cues.
     if (adShowing()) {
       if (!inAd) {
@@ -791,6 +795,8 @@
       resetIndex(video.currentTime);
     }
     const time = video.currentTime;
+    const lateSkip = state.engine === "ema" ? EMA_LATE_SKIP : LATE_SKIP;
+    while (state.index < state.cues.length && time - state.cues[state.index].start > lateSkip) state.index += 1;
     if (state.engine === "ema") prefetch(time);
 
     // Bring the original audio back only for real gaps (music, long pauses).
@@ -799,19 +805,10 @@
       unduck(video);
     }
 
-    while (state.index < state.cues.length) {
-      const cue = state.cues[state.index];
-      if (time < cue.start - (state.engine === "ema" ? EARLY_START : 0)) return;
-      if (time - cue.start > (state.engine === "ema" ? EMA_LATE_SKIP : LATE_SKIP)) {
-        state.index += 1; // fell behind; skip rather than drift
-        continue;
-      }
-      if (speaking()) return; // wait for the current sentence to finish
-      if (state.engine === "ema") speakEma(state.index, video);
-      else speakBrowser(cue, state.cues[state.index + 1], video);
-      state.index += 1;
-      return;
-    }
+    if (!upcoming || speaking() || time < upcoming.start - (state.engine === "ema" ? EARLY_START : 0)) return;
+    if (state.engine === "ema") speakEma(state.index, video);
+    else speakBrowser(upcoming, state.cues[state.index + 1], video);
+    state.index += 1;
   }
 
   // --- control --------------------------------------------------------------
@@ -819,9 +816,8 @@
   function stopSpeech() {
     generation += 1;
     speechSynthesis.cancel();
-    current?.pause();
-    current = null;
-    busy = false;
+    releaseAudio();
+    activeIndex = null;
     const video = getVideo();
     if (video) {
       unduck(video);
@@ -829,29 +825,46 @@
     }
   }
 
+  let startRequest = 0;
   async function start() {
+    const request = ++startRequest;
     const videoId = new URLSearchParams(location.search).get("v");
-    if (!videoId || state.loading) return;
+    const isCurrent = () => state.on && request === startRequest;
+    if (!videoId) {
+      state.loading = false;
+      return;
+    }
     state.loading = true;
     toast("Türkçe ses hazırlanıyor…");
     try {
       // The player can't give captions during an ad; wait for the video itself.
       if (adShowing()) toast("Reklam bitince Türkçe ses başlayacak.");
-      while (adShowing() && state.on) await wait(500);
-      if (!state.on) return;
+      while (adShowing() && isCurrent()) await wait(500);
+      if (!isCurrent()) return;
       // The voice first: whether it can translate decides which captions we need.
       const voice = await startVoice();
-      if (!state.on) return stopVoice();
+      if (!isCurrent()) return;
       state.engine = voice ? "ema" : "browser";
-      // A stale extension (not reloaded after an update) can't pass /translate on: try it once.
-      const localTranslation =
-        Boolean(voice?.translate) && !preferYouTube() && Boolean(await voiceRequest("/translate", { items: [["Hello.", null]] }, 8000));
+      let localTranslation = Boolean(voice?.translate) && !preferYouTube();
       if (state.videoId !== videoId || !state.cues.length || state.localTranslation !== localTranslation) {
-        state.cues = await loadCues(videoId, localTranslation);
+        let result = await loadCues(videoId, localTranslation, isCurrent);
+        if (!isCurrent()) return;
+        if (result.translator === "local") {
+          // Validate the actual model with the first cue we will use, after punctuation has exited.
+          const first = indexAt(result.cues, getVideo()?.currentTime ?? 0);
+          const ok = await translateBatch(result.cues, first, 1);
+          if (!isCurrent()) return;
+          if (!ok) {
+            localTranslation = false;
+            result = await loadCues(videoId, false, isCurrent);
+            if (!isCurrent()) return;
+          }
+        }
+        state.cues = result.cues;
+        state.translator = result.translator;
         state.videoId = videoId;
         state.localTranslation = localTranslation;
       }
-      if (!state.on) return; // turned off while loading
       const translator = { local: ", lokal çeviri", youtube: ", YouTube çevirisi" }[state.translator] ?? "";
       if (state.engine === "ema") toast(`Türkçe ses açık (EMA Lightning${translator})`);
       else if (!state.voice) toast("Türkçe ses bulunamadı, varsayılan ses kullanılıyor.");
@@ -861,19 +874,23 @@
       resetIndex(video?.currentTime ?? 0);
       clearInterval(state.timer);
       state.timer = setInterval(tick, 150);
-      if (state.translator === "local") translateAhead(state.cues);
+      if (state.translator === "local") translateAhead(state.cues, isCurrent);
     } catch (error) {
+      if (!isCurrent()) return;
       log(error);
       toast(error.message);
       setOn(false);
     } finally {
-      state.loading = false;
+      if (request === startRequest) state.loading = false;
     }
   }
 
   function stop() {
+    startRequest += 1;
+    state.loading = false;
     clearInterval(state.timer);
     stopSpeech();
+    clearAudioCache();
     stopVoice();
   }
 
@@ -1008,6 +1025,7 @@
       stopSpeech();
       dropQueued();
       resetIndex(event.target.currentTime);
+      pruneAudioCache(event.target.currentTime);
     },
     true,
   );
@@ -1070,5 +1088,8 @@
   new MutationObserver(mountButton).observe(document.documentElement, { childList: true, subtree: true });
 
   // Debug hook for the console: window.__youdub.state, window.__youdub.loadCues()
-  window.__youdub = { state, captured, loadCues, buildCues, asrWords, sentenceCues, setOn, switchTranslator };
+  window.__youdub = {
+    state, buildCues, asrWords, sentenceCues, setOn, switchTranslator,
+    loadCues: async (...args) => (await loadCues(...args)).cues,
+  };
 })();

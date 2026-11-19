@@ -36,6 +36,7 @@
         "https://www.youtube.com/*"
       ],
       "js": [
+        "caption-cache.js",
         "dub.js",
         "subtitles.js",
         "actions.js"

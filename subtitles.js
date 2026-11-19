@@ -114,37 +114,7 @@
     return { languageCode: source.languageCode, translationLanguage: { languageCode: TARGET_LANG } };
   }
 
-  // --- caption data ---------------------------------------------------------
-
-  // Every caption response the player receives, keyed by video, language and target.
-  // (dub.js keeps its own copy for the voice; the two features don't depend on each other.)
-  const responses = new Map();
-  const key = (videoId, lang, tlang) => `${videoId}|${lang}|${tlang ?? ""}`;
-  function remember(url, body) {
-    if (!body?.trim().startsWith("{")) return; // a refused request gets an HTML page
-    try {
-      const params = new URL(url, location.origin).searchParams;
-      if (params.get("fmt") === "json3") responses.set(key(params.get("v"), params.get("lang"), params.get("tlang")), body);
-    } catch {}
-  }
-  const xhrOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    if (String(url).includes("/api/timedtext")) this.addEventListener("load", () => remember(String(url), this.responseText));
-    return xhrOpen.call(this, method, url, ...rest);
-  };
-  const pageFetch = window.fetch;
-  window.fetch = async function (input, init) {
-    const response = await pageFetch.call(this, input, init);
-    const url = typeof input === "string" ? input : input?.url;
-    if (url?.includes("/api/timedtext")) {
-      response
-        .clone()
-        .text()
-        .then((body) => remember(url, body))
-        .catch(() => {});
-    }
-    return response;
-  };
+  const captionCache = window.__youdubCaptions;
 
   const ENTITIES = { "&gt;": ">", "&lt;": "<", "&amp;": "&", "&quot;": '"', "&#39;": "'", "&nbsp;": " " };
   const clean = (text) =>
@@ -229,7 +199,7 @@
     const track = player.getOption?.("captions", "track");
     const videoId = player.getVideoData?.()?.video_id;
     if (!track?.languageCode || !videoId) return null;
-    return key(videoId, track.languageCode, track.translationLanguage?.languageCode);
+    return captionCache.key(videoId, track.languageCode, track.translationLanguage?.languageCode);
   }
 
   function captionBox(player) {
@@ -319,23 +289,39 @@
     box.classList.add("show");
   }
 
+  function captionAt(time) {
+    let low = 0;
+    let high = captions.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (captions[mid].start <= time) low = mid + 1;
+      else high = mid;
+    }
+    const caption = captions[low - 1];
+    return caption && time < caption.end ? caption : null;
+  }
+
   function render() {
     const player = getPlayer();
     const video = getVideo();
     if (!on || !player || !video) return;
     const wanted = wantedKey(player);
     if (wanted !== captionsKey) {
-      const body = wanted && responses.get(wanted);
+      const body = wanted && captionCache.get(wanted);
       captions = body ? buildCaptions(JSON.parse(body)) : [];
       captionsKey = body ? wanted : null;
       if (body) log("drawing", captions.length, "captions for", wanted);
     }
     player.classList.toggle(OWN_CLASS, captions.length > 0);
-    if (!captions.length) return;
+    if (!captions.length) {
+      const box = document.getElementById(CAPTION_ID);
+      if (box) show(box, null);
+      return;
+    }
     const box = captionBox(player);
     const time = video.currentTime;
     const ad = player.classList.contains("ad-showing");
-    show(box, ad ? null : (captions.find((c) => time >= c.start && time < c.end) ?? null));
+    show(box, ad ? null : captionAt(time));
   }
 
   function startDrawing() {

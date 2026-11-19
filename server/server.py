@@ -9,7 +9,7 @@ from reaching local addresses, so the extension's service worker makes the reque
   POST /punctuate  {"text": "..."}                  ->  {"sentences": [...]}  (English auto captions)
   POST /health                                       ->  {"ok": true, "translate": true}
 
-Translation and punctuation run in a child process that exits when idle (worker.py).
+Translation exits when idle and punctuation exits after each request (worker.py).
 
 Both are POST because the browser leaves the Origin header off an extension's GET.
 """

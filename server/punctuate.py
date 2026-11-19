@@ -5,8 +5,7 @@ Turkish comes out inverted ("devrik"). This model (1-800-BAD-CODE/punct_cap_seg_
 Apache-2.0, int8 ONNX ~53 MB in models/punct-en, built by install.sh) adds punctuation and
 capitals and splits the text into sentences: a whole video in about a second.
 
-It is needed once per video and runs in worker.py's child process, which goes away when
-idle, so its ~140 MB are not held while the video plays.
+It is needed once per video and runs in a child process that exits after the request.
 """
 
 import re
@@ -24,7 +23,7 @@ def available():
 def sentences(text):
     from punctuators.models.punc_cap_seg_model import PunctCapSegConfigONNX, PunctCapSegModelONNX
 
-    model = PunctCapSegModelONNX(PunctCapSegConfigONNX(directory=str(MODEL), **FILES))
+    model = PunctCapSegModelONNX(PunctCapSegConfigONNX(directory=str(MODEL), **FILES), ort_providers=["CPUExecutionProvider"])
     sentences = model.infer([prepare(text)], apply_sbd=True)[0]
     # Characters outside the model's vocabulary come back as "<unk>" (any case); the voice
     # would say "unk". prepare() removes most of them, this catches the rest.

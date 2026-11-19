@@ -47,7 +47,7 @@ Hepsi işlemcinde çalışır. Hiçbir şey bilgisayarından çıkmaz.
 | Çeviri (EN → TR) | [OPUS-MT tc-big en-tr](https://huggingface.co/Helsinki-NLP/opus-mt-tc-big-en-tr), int8 | ~230 MB | CC-BY-4.0 |
 | Noktalama (İngilizce otomatik altyazı) | [punct_cap_seg_en](https://huggingface.co/1-800-BAD-CODE/punct_cap_seg_en), int8 | ~53 MB | Apache 2.0 |
 
-**TR** açıkken ~730 MB RAM kullanır. Çeviri ayrı, düşük öncelikli bir süreçte çalışır ve son istekten 20 sn sonra kapanır.
+Knobs yalnızca oynatma konumuna yakın ses kliplerini bellekte tutar. Noktalama süreci her istekten sonra, çeviri süreci ise yaklaşık 20 saniye boşta kaldığında kapanır. Tepe bellek kullanımı işletim sistemine ve altyazı uzunluğuna göre değişir.
 
 ## Hata ayıklama
 
